@@ -7,6 +7,7 @@ AI 客户端模块
 """
 
 import os
+import time
 from typing import Any, Dict, List
 
 from litellm import completion
@@ -89,17 +90,40 @@ class AIClient:
                 params[key] = value
 
         # 调用 LiteLLM
-        response = completion(**params)
+        # 部分模型/提供商偶发返回 HTTP 200 但 content 为空（如 DeepSeek 高峰期），
+        # 这种"空响应"不会触发 litellm 内部的 num_retries 异常重试，
+        # 因此在这里对空响应单独做重试，最多尝试 empty_retries + 1 次。
+        empty_retries = kwargs.get("empty_retries", self.num_retries)
 
-        # 提取响应内容
-        # 某些模型/提供商返回 list（内容块）而非 str，统一转为 str
-        content = response.choices[0].message.content
-        if isinstance(content, list):
-            content = "\n".join(
-                item.get("text", str(item)) if isinstance(item, dict) else str(item)
-                for item in content
-            )
-        return content or ""
+        for attempt in range(empty_retries + 1):
+            response = completion(**params)
+
+            # 提取响应内容
+            # 某些模型/提供商返回 list（内容块）而非 str，统一转为 str
+            content = ""
+            try:
+                if response.choices:
+                    content = response.choices[0].message.content
+                    if isinstance(content, list):
+                        content = "\n".join(
+                            item.get("text", str(item)) if isinstance(item, dict) else str(item)
+                            for item in content
+                        )
+                    content = content or ""
+            except (AttributeError, IndexError, KeyError):
+                content = ""
+
+            if content.strip():
+                return content
+
+            if attempt < empty_retries:
+                print(
+                    f"[AI] 模型返回空响应，正在重试 ({attempt + 1}/{empty_retries})..."
+                )
+                time.sleep(1 + attempt)
+
+        # 所有重试仍为空时返回空串，由上层 _parse_response 兜底报错
+        return content
 
     def validate_config(self) -> tuple[bool, str]:
         """
